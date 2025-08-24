@@ -168,7 +168,28 @@ def find_table_start(filepath):
     
     return table_info
 
-def process_excel_file(filepath, new_filename):
+def _parse_plx_parts(plx: str):
+    patterns = [
+        r"(\d{2}\.\d{2}\.\d{2})_(\d+)_(\d+)\.plx",
+        r"(\d{2}\.\d{2}\.\d{2})_(\d+)_(\d+)",
+        r"(\d{2}\.\d{2}\.\d{2}).*?(\d{2}).*?(\d{3})",
+    ]
+    for p in patterns:
+        m = re.search(p, plx or "")
+        if m:
+            return m.groups()
+    return None, None, None
+
+
+def _find_col(df, keywords):
+    for c in df.columns:
+        lc = str(c).lower()
+        if all(k in lc for k in keywords):
+            return c
+    return None
+
+
+def process_excel_file(filepath, new_filename, header_info=None):
     """
     Основная функция обработки Excel файла.
     """
@@ -188,9 +209,24 @@ def process_excel_file(filepath, new_filename):
             # Читаем с правильной строки заголовка
             if table_info['has_multiheader']:
                 df = pd.read_excel(filepath, header=[table_info['header_row'], table_info['header_row'] + 1])
-                # Объединяем многоуровневые заголовки
-                df.columns = ['_'.join(col).strip() if col[1] != '' else col[0] 
-                             for col in df.columns.values]
+                # Объединяем многоуровневые заголовки, безопасно приводя части к строкам
+                def _combine_cols(col):
+                    try:
+                        # col может быть кортежем (уровни заголовка)
+                        if isinstance(col, (list, tuple)):
+                            first = "" if pd.isna(col[0]) else str(col[0]).strip()
+                            second = "" if len(col) < 2 or pd.isna(col[1]) else str(col[1]).strip()
+                            if second:
+                                name = f"{first}_{second}".strip("_").strip()
+                            else:
+                                name = first
+                            return name if name else ""
+                        # иначе просто вернуть как строку
+                        return str(col).strip()
+                    except Exception:
+                        return str(col)
+
+                df.columns = [_combine_cols(col) for col in df.columns.values]
             else:
                 df = pd.read_excel(filepath, header=table_info['header_row'])
         else:
@@ -257,35 +293,8 @@ def process_excel_file(filepath, new_filename):
         if 'Индекс' in df.columns:
             df = df[~df['Индекс'].astype(str).str.contains("-", na=False)]
         
-        # --- Обработка модулей ---
-        processed_rows = []
-        current_module = None
-        
-        for _, row in df.iterrows():
-            if 'Наименование' not in row:
-                continue
-                
-            name = str(row['Наименование'])
-            
-            # Проверяем, является ли это модулем
-            if 'модуль' in name.lower() and (
-                'Индекс' not in row or 
-                pd.isna(row.get('Индекс')) or 
-                '+' not in str(row.get('Индекс', ''))
-            ):
-                current_module = name.strip()
-                continue
-            
-            # Если есть активный модуль и это дисциплина в модуле
-            if current_module and 'Индекс' in row and '+' in str(row.get('Индекс', '')):
-                row = row.copy()
-                row['Наименование'] = f"{current_module}. {name}"
-                current_module = None
-            
-            processed_rows.append(row)
-        
-        if processed_rows:
-            df = pd.DataFrame(processed_rows)
+        # --- Модули: оставляем строки-модули как отдельные записи (без объединения) ---
+        # Ничего дополнительно не делаем: просто не сливаем с дочерними строками.
         
         # --- Обработка семестра "34" ---
         if 'Семестр' in df.columns:
@@ -299,40 +308,65 @@ def process_excel_file(filepath, new_filename):
             for full_name, short_name in DEPT_MAP.items():
                 df.loc[df['Кафедра'].astype(str).str.contains(full_name, case=False, na=False), 'Кафедра'] = short_name
         
-        # --- Извлечение данных по семестрам ---
-        
-        # Определяем какие столбцы есть в файле
-        available_cols = df.columns.tolist()
-        
-        # Базовые столбцы для результата
-        result_columns = ['Наименование']
-        if 'Зачет с оц.' in df.columns:
-            result_columns.append('Зачет с оц.')
-        if 'Кафедра' in df.columns:
-            result_columns.append('Кафедра')
-        
-        # Ищем столбцы с данными о часах
-        semester_cols = ['КП', 'КР', 'з.е.', 'Лек', 'Лаб', 'Пр', 'ИКР', 'СР']
-        
-        # Находим столбцы семестров в данных
-        found_sem_cols = []
-        for col in available_cols:
-            for sem_col in semester_cols:
-                if sem_col in str(col):
-                    found_sem_cols.append(col)
-                    break
-        
-        # Если нашли столбцы семестров, добавляем их
-        if found_sem_cols:
-            result_columns.extend(found_sem_cols[:8])  # Берем первые 8 столбцов
-        
-        # Создаем итоговый датафрейм
-        final_df = df[result_columns].copy() if all(col in df.columns for col in result_columns) else df
+        # --- Финальная таблица под вид: Дисциплины | Сем. | З.Е. | Каф. ---
+        # Определяем столбцы-источники
+        sem_col = None
+        # в некоторых файлах колонка называется 'Семестр' или 'Сем.'
+        sem_col = _find_col(df, ['сем']) or ('Семестр' if 'Семестр' in df.columns else None)
+        ze_col = None
+        for cand in df.columns:
+            if 'з.е' in str(cand).lower():
+                ze_col = cand
+                break
+        kaf_col = 'Кафедра' if 'Кафедра' in df.columns else _find_col(df, ['каф'])
+
+        # Подготовим заголовок первой колонки
+        header_title = 'Дисциплины'
+        if header_info and header_info.get('plx_string') and header_info.get('specialization_name'):
+            code, part1, part2 = _parse_plx_parts(header_info.get('plx_string'))
+            spec = SPEC_MAP.get(header_info.get('specialization_name'), '')
+            group_hint = {'САУ': '91-92', 'КСУ': '94', 'РАПС': '', 'ЭТПТ': ''}.get(spec, '')
+            if part1 and part2 and spec:
+                num = f"№{part2}-{part1}"
+                if group_hint:
+                    header_title = f"Дисциплины {spec} {group_hint} 3 курс {num}"
+                else:
+                    header_title = f"Дисциплины {spec} 3 курс {num}"
+
+        # Собираем результат
+        cols = [c for c in [sem_col, ze_col, kaf_col] if c is not None]
+        tmp = df.copy()
+        # Переименуем существующие в целевые
+        rename_map = {}
+        if sem_col:
+            rename_map[sem_col] = 'Сем.'
+        if ze_col:
+            rename_map[ze_col] = 'З.Е.'
+        if kaf_col:
+            rename_map[kaf_col] = 'Каф.'
+        tmp = tmp.rename(columns=rename_map)
+        # Нормализуем 'Каф.' (сокращения уже делали выше)
+        if 'Каф.' in tmp.columns:
+            tmp['Каф.'] = tmp['Каф.'].astype(str).str.strip()
+
+        desired_cols = [header_title, 'Сем.', 'З.Е.', 'Каф.']
+        out = pd.DataFrame({header_title: tmp['Наименование']})
+        if 'Сем.' in tmp.columns:
+            out['Сем.'] = tmp['Сем.']
+        if 'З.Е.' in tmp.columns:
+            out['З.Е.'] = tmp['З.Е.']
+        if 'Каф.' in tmp.columns:
+            out['Каф.'] = tmp['Каф.']
+        # Гарантируем порядок столбцов
+        for c in desired_cols:
+            if c not in out.columns:
+                out[c] = ''
+        out = out[desired_cols]
         
         # Сохраняем результат
         output_path = os.path.join(OUTPUT_DIR, new_filename)
-        final_df.to_excel(output_path, index=False)
-        print(f"  ✓ Сохранено строк: {len(final_df)}")
+        out.to_excel(output_path, index=False)
+        print(f"  ✓ Сохранено строк: {len(out)}")
         print(f"  ✓ Файл сохранен: {new_filename}")
         
         return True
@@ -391,7 +425,7 @@ if __name__ == "__main__":
             new_filename = generate_new_filename(header_info)
             
             # Обрабатываем файл
-            if process_excel_file(filepath, new_filename):
+            if process_excel_file(filepath, new_filename, header_info):
                 successful += 1
             else:
                 failed += 1
